@@ -10,3 +10,4 @@ __pycache__/
 civitai_notifier_config.json
 civitai_model_state.json
 
+*.log
