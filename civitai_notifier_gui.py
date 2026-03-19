@@ -12,12 +12,24 @@ try:
 except ImportError:
     raise SystemExit("Missing dependency: requests\nInstall with: pip install requests")
 
+try:
+    from PIL import Image, ImageDraw
+except ImportError:
+    Image = None
+    ImageDraw = None
+
+try:
+    import pystray
+except ImportError:
+    pystray = None
+
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "civitai_notifier_config.json"
 STATE_PATH = APP_DIR / "civitai_model_state.json"
 DEFAULT_INTERVAL_SECONDS = 300
 NOTIFY_WINDOW_HOURS = 48
 FIRST_RUN_NOTIFY_HOURS = 24
+DEFAULT_ICON_NAME = "app.ico"
 
 
 class NotifierCore:
@@ -107,7 +119,12 @@ class NotifierCore:
                 "initializedAt": datetime.now().isoformat(),
             }
             self.save_state(all_state)
-            return {"ok": True, "new_count": len(notified_version_ids), "total_count": len(current_records), "initialized": True}
+            return {
+                "ok": True,
+                "new_count": len(notified_version_ids),
+                "total_count": len(current_records),
+                "initialized": True,
+            }
 
         new_records = []
         now_ms = int(time.time() * 1000)
@@ -262,30 +279,55 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("Civitai Notifier")
-        self.root.geometry("900x700")
+        self.root.geometry("960x760")
 
         self.username_var = StringVar()
         self.webhook_var = StringVar()
         self.api_key_var = StringVar()
         self.proxy_var = StringVar()
-        self.interval_var = StringVar(value="300")
+        self.interval_var = StringVar(value=str(DEFAULT_INTERVAL_SECONDS))
         self.auto_start_var = BooleanVar(value=False)
+        self.icon_path_var = StringVar(value=DEFAULT_ICON_NAME)
 
         self.status_var = StringVar(value="Stopped")
         self.last_run_var = StringVar(value="-")
         self.next_run_var = StringVar(value="-")
         self.total_models_var = StringVar(value="0")
         self.last_new_var = StringVar(value="0")
+        self.tray_status_var = StringVar(value="未最小化到托盘")
 
         self.core = NotifierCore(self.thread_safe_log)
         self.worker_thread = None
         self.stop_event = threading.Event()
         self.is_running = False
+        self.tray_icon = None
+        self.tray_thread = None
+        self.tray_visible = False
+        self.exiting = False
 
-        self.build_ui()
+        self.ensure_default_config()
         self.load_config()
+        self.apply_window_icon()
+        self.build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self.handle_close_request)
+
         if self.auto_start_var.get():
-            self.start_loop()
+            self.root.after(300, self.start_loop)
+
+    def ensure_default_config(self):
+        if CONFIG_PATH.exists():
+            return
+        cfg = {
+            "username": "",
+            "webhook": "",
+            "api_key": "",
+            "proxy_url": "",
+            "interval_seconds": DEFAULT_INTERVAL_SECONDS,
+            "auto_start": False,
+            "icon_path": DEFAULT_ICON_NAME,
+            "_comment": "icon_path 可写相对路径，例如 app.ico；开机无控制台建议用 pythonw.exe 启动。",
+        }
+        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def build_ui(self):
         frm = ttk.Frame(self.root, padding=12)
@@ -299,8 +341,9 @@ class App:
         self.add_labeled_entry(config_frame, "Civitai API Key", self.api_key_var, 2, show="*")
         self.add_labeled_entry(config_frame, "代理 URL（可选）", self.proxy_var, 3)
         self.add_labeled_entry(config_frame, "轮询间隔（秒）", self.interval_var, 4)
+        self.add_labeled_entry(config_frame, "图标路径（相对根目录或绝对路径）", self.icon_path_var, 5)
 
-        ttk.Checkbutton(config_frame, text="启动时自动开始", variable=self.auto_start_var).grid(row=5, column=1, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(config_frame, text="启动时自动开始", variable=self.auto_start_var).grid(row=6, column=1, sticky="w", pady=(6, 0))
 
         button_frame = ttk.Frame(frm)
         button_frame.pack(fill="x", pady=10)
@@ -308,6 +351,8 @@ class App:
         ttk.Button(button_frame, text="立即执行一次", command=self.run_once_async).pack(side="left", padx=(0, 8))
         ttk.Button(button_frame, text="开始循环", command=self.start_loop).pack(side="left", padx=(0, 8))
         ttk.Button(button_frame, text="停止", command=self.stop_loop).pack(side="left", padx=(0, 8))
+        ttk.Button(button_frame, text="最小化到托盘", command=self.minimize_to_tray).pack(side="left", padx=(0, 8))
+        ttk.Button(button_frame, text="重新加载图标", command=self.reload_icon).pack(side="left")
 
         status_frame = ttk.LabelFrame(frm, text="状态", padding=10)
         status_frame.pack(fill="x")
@@ -317,6 +362,7 @@ class App:
         self.add_status_row(status_frame, "下次运行", self.next_run_var, 2)
         self.add_status_row(status_frame, "最近一次发现新版本数", self.last_new_var, 3)
         self.add_status_row(status_frame, "当前抓取模型数", self.total_models_var, 4)
+        self.add_status_row(status_frame, "托盘状态", self.tray_status_var, 5)
 
         log_frame = ttk.LabelFrame(frm, text="日志", padding=10)
         log_frame.pack(fill="both", expand=True, pady=(10, 0))
@@ -325,7 +371,7 @@ class App:
         self.log_text.pack(fill="both", expand=True)
         self.log_text.configure(state="disabled")
 
-    def add_labeled_entry(self, parent, label, var, row, width=50, show=None):
+    def add_labeled_entry(self, parent, label, var, row, width=58, show=None):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=4)
         entry = ttk.Entry(parent, textvariable=var, width=width, show=show)
         entry.grid(row=row, column=1, sticky="ew", pady=4)
@@ -336,35 +382,18 @@ class App:
         ttk.Label(parent, textvariable=var).grid(row=row, column=1, sticky="w", pady=2)
 
     def load_config(self):
-        if not CONFIG_PATH.exists():
-            self.create_default_config_file()
-
         try:
             cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         except Exception:
-            self.thread_safe_log(f"配置文件读取失败：{CONFIG_PATH}")
             return
 
-        self.username_var.set(cfg.get("username") or cfg.get("CIVITAI_USERNAME", ""))
-        self.webhook_var.set(cfg.get("webhook") or cfg.get("DISCORD_WEBHOOK_URL", ""))
-        self.api_key_var.set(cfg.get("api_key") or cfg.get("CIVITAI_API_KEY", ""))
+        self.username_var.set(cfg.get("username", ""))
+        self.webhook_var.set(cfg.get("webhook", ""))
+        self.api_key_var.set(cfg.get("api_key", ""))
         self.proxy_var.set(cfg.get("proxy_url", ""))
         self.interval_var.set(str(cfg.get("interval_seconds", DEFAULT_INTERVAL_SECONDS)))
         self.auto_start_var.set(bool(cfg.get("auto_start", False)))
-        self.thread_safe_log(f"已加载配置文件：{CONFIG_PATH}")
-
-    def create_default_config_file(self):
-        default_cfg = {
-            "username": "",
-            "webhook": "",
-            "api_key": "",
-            "proxy_url": "",
-            "interval_seconds": DEFAULT_INTERVAL_SECONDS,
-            "auto_start": False,
-            "_comment": "可直接编辑此文件来配置 Civitai 用户名、Discord Webhook、API Key。",
-        }
-        CONFIG_PATH.write_text(json.dumps(default_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.thread_safe_log(f"已创建默认配置文件：{CONFIG_PATH}")
+        self.icon_path_var.set(cfg.get("icon_path", DEFAULT_ICON_NAME))
 
     def save_config(self):
         try:
@@ -380,9 +409,10 @@ class App:
             "proxy_url": self.proxy_var.get().strip(),
             "interval_seconds": interval,
             "auto_start": self.auto_start_var.get(),
-            "_comment": "可直接编辑此文件来配置 Civitai 用户名、Discord Webhook、API Key。",
+            "icon_path": self.icon_path_var.get().strip() or DEFAULT_ICON_NAME,
         }
         CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.apply_window_icon()
         self.thread_safe_log(f"配置已保存到 {CONFIG_PATH}")
 
     def get_interval_seconds(self):
@@ -496,6 +526,122 @@ class App:
 
         self.root.after(0, append)
 
+    def reload_icon(self):
+        self.apply_window_icon()
+        if self.tray_visible:
+            self.stop_tray_icon()
+            self.start_tray_icon()
+        self.thread_safe_log("图标已重新加载。")
+
+    def get_icon_path(self):
+        raw = self.icon_path_var.get().strip() or DEFAULT_ICON_NAME
+        path = Path(raw)
+        if not path.is_absolute():
+            path = APP_DIR / path
+        return path
+
+    def apply_window_icon(self):
+        icon_path = self.get_icon_path()
+        if icon_path.exists() and icon_path.suffix.lower() == ".ico":
+            try:
+                self.root.iconbitmap(default=str(icon_path))
+                return
+            except Exception:
+                pass
+
+    def handle_close_request(self):
+        choice = messagebox.askyesnocancel(
+            "关闭窗口",
+            "选择“是”将完全退出程序；选择“否”将最小化到系统托盘；选择“取消”则不做任何操作。",
+        )
+        if choice is None:
+            return
+        if choice:
+            self.close_app()
+        else:
+            self.minimize_to_tray()
+
+    def minimize_to_tray(self):
+        if pystray is None or Image is None:
+            messagebox.showerror(
+                "缺少依赖",
+                "最小化到系统托盘需要安装 pystray 和 pillow。\n\npip install pystray pillow",
+            )
+            return
+        if not self.tray_visible:
+            self.start_tray_icon()
+        self.root.withdraw()
+        self.tray_status_var.set("已最小化到托盘")
+        self.thread_safe_log("窗口已最小化到系统托盘。")
+
+    def restore_from_tray(self):
+        self.root.after(0, self._restore_window_ui)
+
+    def _restore_window_ui(self):
+        self.stop_tray_icon()
+        self.root.deiconify()
+        self.root.after(50, self.root.lift)
+        self.root.after(100, lambda: self.root.attributes("-topmost", True))
+        self.root.after(200, lambda: self.root.attributes("-topmost", False))
+        self.tray_status_var.set("未最小化到托盘")
+        self.thread_safe_log("窗口已从托盘恢复。")
+
+    def close_app(self):
+        self.exiting = True
+        self.stop_event.set()
+        self.is_running = False
+        self.stop_tray_icon()
+        self.root.after(0, self.root.destroy)
+
+    def create_tray_image(self):
+        icon_path = self.get_icon_path()
+        if icon_path.exists() and Image is not None:
+            try:
+                image = Image.open(icon_path)
+                return image
+            except Exception:
+                pass
+
+        if Image is None:
+            return None
+
+        image = Image.new("RGBA", (64, 64), (32, 32, 32, 255))
+        draw = ImageDraw.Draw(image)
+        draw.rounded_rectangle((8, 8, 56, 56), radius=10, fill=(80, 120, 255, 255))
+        draw.text((18, 20), "CN", fill=(255, 255, 255, 255))
+        return image
+
+    def start_tray_icon(self):
+        if pystray is None or Image is None or self.tray_visible:
+            return
+
+        image = self.create_tray_image()
+        if image is None:
+            return
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Open Window / 打开窗口", lambda icon, item: self.restore_from_tray()),
+            pystray.MenuItem("Close / 关闭", lambda icon, item: self.close_app()),
+        )
+        self.tray_icon = pystray.Icon("civitai_notifier", image, "Civitai Notifier", menu)
+        self.tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
+        self.tray_thread.start()
+        self.tray_visible = True
+        self.tray_status_var.set("已最小化到托盘")
+
+    def stop_tray_icon(self):
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+        self.tray_icon = None
+        self.tray_thread = None
+        self.tray_visible = False
+        if not self.exiting:
+            self.tray_status_var.set("未最小化到托盘")
+
+
 
 def build_models_url(username, api_key):
     from urllib.parse import urlencode
@@ -511,6 +657,7 @@ def build_models_url(username, api_key):
     return f"https://civitai.com/api/v1/models?{urlencode(params)}"
 
 
+
 def patch_next_page_url(next_page_url, api_key):
     from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
@@ -524,11 +671,13 @@ def patch_next_page_url(next_page_url, api_key):
     return urlunparse((parts.scheme, parts.netloc, parts.path, parts.params, urlencode(query), parts.fragment))
 
 
+
 def safe_read_text_response(resp):
     try:
         return resp.text
     except Exception:
         return ""
+
 
 
 def safe_parse_time(value):
@@ -541,6 +690,7 @@ def safe_parse_time(value):
         return None
 
 
+
 def pick_published_time(model, latest_version):
     return (
         (latest_version or {}).get("publishedAt")
@@ -549,6 +699,7 @@ def pick_published_time(model, latest_version):
         or (model or {}).get("createdAt")
         or None
     )
+
 
 
 def pick_latest_version(model):
@@ -565,6 +716,7 @@ def pick_latest_version(model):
     return sorted(versions, key=sort_key, reverse=True)[0]
 
 
+
 def extract_preview_image(version):
     images = version.get("images") if isinstance(version, dict) else []
     images = images if isinstance(images, list) else []
@@ -572,6 +724,7 @@ def extract_preview_image(version):
         if isinstance(image, dict) and image.get("url"):
             return image["url"]
     return None
+
 
 
 def build_model_record(model, fallback_username):
@@ -594,8 +747,10 @@ def build_model_record(model, fallback_username):
     }
 
 
+
 def format_display_time(value):
     return value or "Unknown"
+
 
 
 def format_discord_payload(record):

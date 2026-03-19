@@ -3,7 +3,10 @@
 .venv/
 .idea
 .idea/
+__pycache__/
+*.pyc
 
 *.json
 civitai_notifier_config.json
 civitai_model_state.json
+
